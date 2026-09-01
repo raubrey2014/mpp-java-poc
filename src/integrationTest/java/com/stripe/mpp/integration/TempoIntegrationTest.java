@@ -5,6 +5,7 @@ import com.stripe.mpp.ChallengeEcho;
 import com.stripe.mpp.Credential;
 import com.stripe.mpp.Mpp;
 import com.stripe.mpp.Receipt;
+import com.stripe.mpp.methods.tempo.Attribution;
 import com.stripe.mpp.methods.tempo.Tempo;
 import com.stripe.mpp.methods.tempo.TempoChargeIntent;
 import com.stripe.mpp.methods.tempo.TempoMethod;
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.web3j.abi.FunctionEncoder;
 import org.web3j.abi.datatypes.Address;
 import org.web3j.abi.datatypes.Function;
+import org.web3j.abi.datatypes.generated.Bytes32;
 import org.web3j.abi.datatypes.generated.Uint256;
 import org.web3j.crypto.Credentials;
 import org.web3j.crypto.Sign;
@@ -84,7 +86,7 @@ class TempoIntegrationTest {
     /** Client signs a transaction and passes it raw — server broadcasts and verifies. */
     @Test
     void transactionCredentialVerifies() throws Exception {
-        String rawTx = buildSignedTx(nextNonce(), BigInteger.valueOf(1_000L));
+        String rawTx = buildSignedTx(nextNonce(), BigInteger.valueOf(1_000L), boundMemo());
 
         TempoChargeIntent intent = Tempo.chargeIntent(rpcUrl);
         Credential credential = txCredential(rawTx);
@@ -99,7 +101,7 @@ class TempoIntegrationTest {
     /** Client broadcasts first and passes only the hash — server polls for the receipt. */
     @Test
     void hashCredentialVerifies() throws Exception {
-        String rawTx  = buildSignedTx(nextNonce(), BigInteger.valueOf(1_000L));
+        String rawTx  = buildSignedTx(nextNonce(), BigInteger.valueOf(1_000L), boundMemo());
         String txHash = rpc("eth_sendRawTransaction", List.of(rawTx));
 
         TempoChargeIntent intent = Tempo.chargeIntent(rpcUrl);
@@ -126,8 +128,9 @@ class TempoIntegrationTest {
         assertThat(r1).isInstanceOf(VerifyResult.Challenged.class);
         Challenge challenge = ((VerifyResult.Challenged) r1).challenge();
 
-        // Step 2: client builds a transaction and wraps it in a credential
-        String rawTx = buildSignedTx(nextNonce(), tokenAmount);
+        // Step 2: client builds a transaction bound to this challenge and wraps it in a credential
+        String rawTx = buildSignedTx(nextNonce(), tokenAmount,
+            Attribution.encode(challenge.realm(), challenge.id()));
         Credential credential = new Credential(challenge.toEcho(), Map.of("type", "transaction", "signature", rawTx), null);
 
         // Step 3: retry with the credential
@@ -192,9 +195,13 @@ class TempoIntegrationTest {
         );
     }
 
+    private static String boundMemo() {
+        return Attribution.encode("localhost", "test-id");
+    }
+
     /**
-     * Build a signed Tempo 0x76 transaction that calls transfer(address,uint256)
-     * on the TIP-20 token contract.
+     * Build a signed Tempo 0x76 transaction that calls transferWithMemo(address,uint256,bytes32)
+     * on the TIP-20 token contract with an MPP attribution memo bound to the credential's challenge.
      *
      * <p>Tempo uses a custom transaction type (0x76) distinct from legacy EVM transactions.
      * RLP field order (tempo-primitives TempoTransaction):
@@ -202,11 +209,11 @@ class TempoIntegrationTest {
      * nonce_key, nonce, valid_before, valid_after, fee_token, fee_payer_signature,
      * tempo_auth_list — followed by the secp256k1 signature bytes (r||s||v, 65 bytes).
      */
-    private String buildSignedTx(BigInteger nonce, BigInteger tokenAmount) throws Exception {
-        // ABI-encode transfer(address, uint256) call data
+    private String buildSignedTx(BigInteger nonce, BigInteger tokenAmount, String memoHex) throws Exception {
+        byte[] memoBytes = Numeric.hexStringToByteArray(memoHex);
         Function function = new Function(
-            "transfer",
-            Arrays.asList(new Address(RECIPIENT), new Uint256(tokenAmount)),
+            "transferWithMemo",
+            Arrays.asList(new Address(RECIPIENT), new Uint256(tokenAmount), new Bytes32(memoBytes)),
             Collections.emptyList()
         );
         byte[] callData = Numeric.hexStringToByteArray(FunctionEncoder.encode(function));
