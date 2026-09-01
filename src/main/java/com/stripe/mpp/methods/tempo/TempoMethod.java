@@ -104,12 +104,13 @@ public class TempoMethod implements Method {
         }
 
         /**
-         * Sets an explicit TIP-20 memo that payments must match.
+         * Sets an explicit TIP-20 memo that payments must match in addition to
+         * the challenge-bound MPP attribution memo.
          *
-         * <p>When omitted, clients write an MPP attribution memo bound to the
-         * challenge and the server requires that binding. An explicit memo is
-         * matched exactly and is not challenge-bound — the caller must make it
-         * unique per challenge if hash reuse across challenges should be rejected.
+         * <p>Verification always requires an on-chain memo bound to the
+         * challenge id and realm. A method-wide static value cannot satisfy
+         * that binding across distinct challenges, so omit this unless the
+         * advertised memo is itself unique per challenge.
          */
         public Builder memo(String memo) {
             this.memo = Objects.requireNonNull(memo, "memo");

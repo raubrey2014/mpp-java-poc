@@ -29,11 +29,12 @@ import java.util.regex.Pattern;
  * </ul>
  *
  * <p>A qualifying Transfer of the requested token, recipient and amount is not
- * enough. Unless the merchant set an explicit memo, the matched logs must include
- * a {@code TransferWithMemo} whose memo is bound to this challenge (MPP attribution
- * tag, server fingerprint of the challenge realm, and nonce
- * {@code keccak256(challengeId)[0..6]}). That is what stops a third party from
- * presenting someone else's settled transaction as their own payment.
+ * enough. The matched logs must include a {@code TransferWithMemo} whose memo
+ * is bound to this challenge (MPP attribution tag, server fingerprint of the
+ * challenge realm, and nonce {@code keccak256(challengeId)[0..6]}). A merchant
+ * memo, when present, is an additional exact-match constraint — it does not
+ * skip that binding. That is what stops a third party from presenting someone
+ * else's settled transaction as their own payment.
  *
  * <p>Create the intent once and reuse it so its replay store is shared across requests:
  *
@@ -159,9 +160,7 @@ public class TempoChargeIntent implements Intent {
                         "transaction logs contain no Transfer matching the request currency, recipient, and amount"
                     );
                 }
-                if (memoFrom(request) == null) {
-                    assertChallengeBoundMemo(matched, credential);
-                }
+                assertChallengeBoundMemo(matched, credential);
                 return Receipt.success(txHash, "tempo");
             }
             if (i < maxRetries - 1) {

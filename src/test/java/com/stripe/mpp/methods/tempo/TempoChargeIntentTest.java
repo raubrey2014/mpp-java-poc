@@ -49,11 +49,15 @@ class TempoChargeIntentTest {
     }
 
     static Credential hashCredential(String txHash) {
-        return hashCredential(txHash, null);
+        return hashCredential(txHash, (String) null);
     }
 
     static Credential hashCredential(String txHash, String source) {
         return new Credential(ECHO, Map.of("type", "hash", "hash", txHash), source);
+    }
+
+    static Credential hashCredential(String txHash, ChallengeEcho echo) {
+        return new Credential(echo, Map.of("type", "hash", "hash", txHash), null);
     }
 
     static String didPkh(int chainId, String address) {
@@ -370,12 +374,11 @@ class TempoChargeIntentTest {
 
     @Test
     void explicitMemoMustMatchExactly() {
-        String merchantMemo = "0x" + "ab".repeat(32);
         Map<String, Object> request = new HashMap<>(REQUEST);
-        request.put("memo", merchantMemo);
+        request.put("memo", BOUND_MEMO);
 
         Receipt result = intent(new StubRpc(null,
-            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, merchantMemo), 0))
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, BOUND_MEMO), 0))
             .verify(hashCredential("0xpushedtx"), request);
         assertThat(result.status()).isEqualTo("success");
     }
@@ -383,31 +386,31 @@ class TempoChargeIntentTest {
     @Test
     void explicitMemoMismatchIsRejected() {
         String merchantMemo = "0x" + "ab".repeat(32);
-        String otherMemo = "0x" + "cd".repeat(32);
         Map<String, Object> request = new HashMap<>(REQUEST);
         request.put("memo", merchantMemo);
 
         assertThatThrownBy(() -> intent(new StubRpc(null,
-            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, otherMemo), 0))
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, BOUND_MEMO), 0))
             .verify(hashCredential("0xpushedtx"), request))
             .isInstanceOf(VerificationFailedException.class)
             .hasMessageContaining("Transfer");
     }
 
     @Test
-    void explicitMemoDoesNotRequireChallengeBinding() {
+    void explicitMemoDoesNotBypassChallengeBinding() {
         String merchantMemo = "0x" + "ab".repeat(32);
         Map<String, Object> request = new HashMap<>(REQUEST);
         request.put("memo", merchantMemo);
 
-        Receipt result = intent(new StubRpc(null,
+        assertThatThrownBy(() -> intent(new StubRpc(null,
             receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, merchantMemo), 0))
-            .verify(hashCredential("0xpushedtx"), request);
-        assertThat(result.status()).isEqualTo("success");
+            .verify(hashCredential("0xpushedtx"), request))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound to this challenge");
     }
 
     @Test
-    void explicitMemoInMethodDetailsIsHonored() {
+    void explicitMemoInMethodDetailsStillRequiresChallengeBinding() {
         String merchantMemo = "0x" + "ab".repeat(32);
         Map<String, Object> request = Map.of(
             "amount", String.valueOf(AMOUNT_ATOMIC),
@@ -416,10 +419,60 @@ class TempoChargeIntentTest {
             "methodDetails", Map.of("chainId", CHAIN_ID, "memo", merchantMemo)
         );
 
-        Receipt result = intent(new StubRpc(null,
+        assertThatThrownBy(() -> intent(new StubRpc(null,
             receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, merchantMemo), 0))
-            .verify(hashCredential("0xpushedtx"), request);
-        assertThat(result.status()).isEqualTo("success");
+            .verify(hashCredential("0xpushedtx"), request))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound to this challenge");
+    }
+
+    @Test
+    void sharedExplicitMemoCannotSatisfyADifferentChallenge() {
+        ChallengeEcho echoA = new ChallengeEcho(
+            "chal-a", "api.example.com", "tempo", "charge", "e30", "2099-01-01T00:00:00Z", null, null
+        );
+        ChallengeEcho echoB = new ChallengeEcho(
+            "chal-b", "api.example.com", "tempo", "charge", "e30", "2099-01-01T00:00:00Z", null, null
+        );
+        String merchantMemo = "0x" + "ab".repeat(32);
+        Map<String, Object> request = new HashMap<>(REQUEST);
+        request.put("memo", merchantMemo);
+        Map<String, Object> paidForB = receiptWithMemoLog(
+            TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, merchantMemo);
+
+        Store store = new MemoryStore();
+        assertThatThrownBy(() -> intent(new StubRpc(null, paidForB, 0), store)
+            .verify(hashCredential("0xvictimtx", echoA), request))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound to this challenge");
+
+        assertThatThrownBy(() -> intent(new StubRpc(null, paidForB, 0), store)
+            .verify(hashCredential("0xvictimtx", echoB), request))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound to this challenge");
+    }
+
+    @Test
+    void stolenBoundPaymentCannotSatisfyADifferentChallenge() {
+        ChallengeEcho echoA = new ChallengeEcho(
+            "chal-a", "api.example.com", "tempo", "charge", "e30", "2099-01-01T00:00:00Z", null, null
+        );
+        ChallengeEcho echoB = new ChallengeEcho(
+            "chal-b", "api.example.com", "tempo", "charge", "e30", "2099-01-01T00:00:00Z", null, null
+        );
+        String memoForB = Attribution.encode(echoB.realm(), echoB.id());
+        Store store = new MemoryStore();
+
+        assertThatThrownBy(() -> intent(new StubRpc(null,
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, memoForB), 0), store)
+            .verify(hashCredential("0xvictimtx", echoA), REQUEST))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound to this challenge");
+
+        Receipt result = intent(new StubRpc(null,
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, memoForB), 0), store)
+            .verify(hashCredential("0xvictimtx", echoB), REQUEST);
+        assertThat(result.reference()).isEqualTo("0xvictimtx");
     }
 
     @Test
