@@ -8,6 +8,7 @@ import com.stripe.mpp.store.MemoryStore;
 import com.stripe.mpp.store.Store;
 import org.junit.jupiter.api.Test;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -18,53 +19,88 @@ class TempoChargeIntentTest {
 
     static final String RPC_URL = "https://rpc.example.com";
 
-    // Realistic addresses used across all tests
     static final String TOKEN_CONTRACT = TempoDefaults.TESTNET_PATH_USD;
     static final String SENDER    = "0x1234567890123456789012345678901234567890";
     static final String RECIPIENT = "0xabcdef1234567890abcdef1234567890abcdef12";
-    static final long   AMOUNT_ATOMIC = 1_000_000L; // 1 token with 6 decimals
+    static final long   AMOUNT_ATOMIC = 1_000_000L;
+    static final int     CHAIN_ID = TempoDefaults.TESTNET_CHAIN_ID;
 
-    // Request as it arrives at verify() — amount already in atomic units, currency = contract address
     static final Map<String, Object> REQUEST = Map.of(
         "amount", String.valueOf(AMOUNT_ATOMIC),
         "currency", TOKEN_CONTRACT,
         "recipient", RECIPIENT
     );
 
+    static final Map<String, Object> REQUEST_WITH_CHAIN = Map.of(
+        "amount", String.valueOf(AMOUNT_ATOMIC),
+        "currency", TOKEN_CONTRACT,
+        "recipient", RECIPIENT,
+        "methodDetails", Map.of("chainId", CHAIN_ID)
+    );
+
     static final ChallengeEcho ECHO = new ChallengeEcho(
         "chal-id", "api.example.com", "tempo", "charge", "e30", "2099-01-01T00:00:00Z", null, null
     );
+
+    static final String BOUND_MEMO = Attribution.encode(ECHO.realm(), ECHO.id());
 
     static Credential txCredential(String rawTx) {
         return new Credential(ECHO, Map.of("type", "transaction", "signature", rawTx), null);
     }
 
     static Credential hashCredential(String txHash) {
-        return new Credential(ECHO, Map.of("type", "hash", "hash", txHash), null);
+        return hashCredential(txHash, null);
     }
 
-    /** Build a receipt whose Transfer log exactly matches REQUEST. */
+    static Credential hashCredential(String txHash, String source) {
+        return new Credential(ECHO, Map.of("type", "hash", "hash", txHash), source);
+    }
+
+    static String didPkh(int chainId, String address) {
+        return "did:pkh:eip155:" + chainId + ":" + address;
+    }
+
+    /** Bound TransferWithMemo log matching REQUEST and ECHO. */
     static Map<String, Object> successReceipt() {
-        return receiptWithLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC);
+        return receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, BOUND_MEMO);
     }
 
-    /** Build a receipt containing one ERC-20 Transfer log with the given parameters. */
     static Map<String, Object> receiptWithLog(String contract, String from, String to, long amount) {
-        String senderTopic    = "0x000000000000000000000000" + from.substring(2);
-        String recipientTopic = "0x000000000000000000000000" + to.substring(2);
-        String amountData     = "0x" + String.format("%064x", amount);
+        return receiptWithTopics(
+            contract, from, to, amount,
+            List.of(TempoChargeIntent.TRANSFER_TOPIC, topic(from), topic(to)),
+            from
+        );
+    }
+
+    static Map<String, Object> receiptWithMemoLog(
+        String contract, String from, String to, long amount, String memo
+    ) {
+        return receiptWithTopics(
+            contract, from, to, amount,
+            List.of(TempoChargeIntent.TRANSFER_WITH_MEMO_TOPIC, topic(from), topic(to), memo),
+            from
+        );
+    }
+
+    static Map<String, Object> receiptWithTopics(
+        String contract, String from, String to, long amount, List<String> topics, String receiptFrom
+    ) {
+        String amountData = "0x" + String.format("%064x", amount);
         return Map.of(
             "status", "0x1",
-            "from", from,
+            "from", receiptFrom,
             "logs", List.of(Map.of(
                 "address", contract,
-                "topics", List.of(TempoChargeIntent.TRANSFER_TOPIC, senderTopic, recipientTopic),
+                "topics", topics,
                 "data", amountData
             ))
         );
     }
 
-    // --- Stub RPC ---
+    static String topic(String address) {
+        return "0x000000000000000000000000" + address.substring(2);
+    }
 
     static class StubRpc extends TempoRpc {
         private final String txHashOnSend;
@@ -92,8 +128,6 @@ class TempoChargeIntentTest {
     static TempoChargeIntent intent(TempoRpc rpc, Store store) {
         return new TempoChargeIntent(RPC_URL, 5, 0, rpc, store);
     }
-
-    // --- Existing transport / broadcast tests ---
 
     @Test
     void pullPaymentBroadcastsAndReturnsReceipt() {
@@ -202,8 +236,6 @@ class TempoChargeIntentTest {
             .hasMessageContaining("missing or invalid payload");
     }
 
-    // --- Transfer log validation tests ---
-
     @Test
     void wrongTokenContractThrows() {
         String otherContract = "0xdeaddeaddeaddeaddeaddeaddeaddeaddeaddead";
@@ -235,16 +267,11 @@ class TempoChargeIntentTest {
 
     @Test
     void wrongSenderThrows() {
-        String otherSender = "0x8888888888888888888888888888888888888888";
-        // log.from matches SENDER but receipt.from is otherSender — mismatch
-        StubRpc rpc = new StubRpc("0xtx", receiptWithLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC), 0);
-        Map<String, Object> baseReceipt = receiptWithLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC);
-        // Rebuild receipt with a different "from" field
-        Map<String, Object> tampered = new java.util.HashMap<>(baseReceipt);
-        tampered.put("from", otherSender);
-        StubRpc rpc2 = new StubRpc("0xtx", tampered, 0);
+        Map<String, Object> tampered = new HashMap<>(successReceipt());
+        tampered.put("from", RECIPIENT);
+        StubRpc rpc = new StubRpc("0xtx", tampered, 0);
 
-        assertThatThrownBy(() -> intent(rpc2).verify(txCredential("0xsignedtx"), REQUEST))
+        assertThatThrownBy(() -> intent(rpc).verify(txCredential("0xsignedtx"), REQUEST))
             .isInstanceOf(VerificationFailedException.class)
             .hasMessageContaining("Transfer");
     }
@@ -260,22 +287,145 @@ class TempoChargeIntentTest {
     }
 
     @Test
-    void transferWithMemoTopicAccepted() {
-        // TransferWithMemo has amount in data and memo in topics[3]; should still verify.
-        String senderTopic    = "0x000000000000000000000000" + SENDER.substring(2);
-        String recipientTopic = "0x000000000000000000000000" + RECIPIENT.substring(2);
-        String memoTopic      = "0x" + String.format("%064x", 42); // arbitrary memo
-        String amountData     = "0x" + String.format("%064x", AMOUNT_ATOMIC);
+    void pushRejectsPlainTransferWithoutChallengeBoundMemo() {
+        StubRpc rpc = new StubRpc(null, receiptWithLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC), 0);
+
+        assertThatThrownBy(() -> intent(rpc).verify(hashCredential("0xstolen"), REQUEST))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound to this challenge");
+    }
+
+    @Test
+    void pushRejectsMemoBoundToADifferentChallenge() {
+        String stolenMemo = Attribution.encode(ECHO.realm(), "other-challenge");
+        StubRpc rpc = new StubRpc(null,
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, stolenMemo), 0);
+
+        assertThatThrownBy(() -> intent(rpc).verify(hashCredential("0xstolen"), REQUEST))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound to this challenge");
+    }
+
+    @Test
+    void pushRejectsMemoBoundToADifferentRealm() {
+        String stolenMemo = Attribution.encode("other.example.com", ECHO.id());
+        StubRpc rpc = new StubRpc(null,
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, stolenMemo), 0);
+
+        assertThatThrownBy(() -> intent(rpc).verify(hashCredential("0xstolen"), REQUEST))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound to this challenge");
+    }
+
+    @Test
+    void pushRejectsArbitraryNonMppMemo() {
+        String arbitrary = "0x" + String.format("%064x", 42);
+        StubRpc rpc = new StubRpc(null,
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, arbitrary), 0);
+
+        assertThatThrownBy(() -> intent(rpc).verify(hashCredential("0xpushedtx"), REQUEST))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound to this challenge");
+    }
+
+    @Test
+    void unboundMemoDoesNotConsumeReplayClaim() {
+        Store store = new MemoryStore();
+        StubRpc plain = new StubRpc(null, receiptWithLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC), 0);
+
+        assertThatThrownBy(() -> intent(plain, store).verify(hashCredential("0xunrelated"), REQUEST))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("memo is not bound");
+
+        Receipt receipt = intent(new StubRpc(null, successReceipt(), 0), store)
+            .verify(hashCredential("0xunrelated"), REQUEST);
+        assertThat(receipt.reference()).isEqualTo("0xunrelated");
+    }
+
+    @Test
+    void pushAcceptsChallengeBoundMemoAlongsideAPlainTransfer() {
+        String senderTopic = topic(SENDER);
+        String recipientTopic = topic(RECIPIENT);
+        String amountData = "0x" + String.format("%064x", AMOUNT_ATOMIC);
         Map<String, Object> receipt = Map.of(
             "status", "0x1",
             "from", SENDER,
-            "logs", List.of(Map.of(
-                "address", TOKEN_CONTRACT,
-                "topics", List.of(TempoChargeIntent.TRANSFER_WITH_MEMO_TOPIC,
-                    senderTopic, recipientTopic, memoTopic),
-                "data", amountData
-            ))
+            "logs", List.of(
+                Map.of(
+                    "address", TOKEN_CONTRACT,
+                    "topics", List.of(TempoChargeIntent.TRANSFER_TOPIC, senderTopic, recipientTopic),
+                    "data", amountData
+                ),
+                Map.of(
+                    "address", TOKEN_CONTRACT,
+                    "topics", List.of(TempoChargeIntent.TRANSFER_WITH_MEMO_TOPIC,
+                        senderTopic, recipientTopic, BOUND_MEMO),
+                    "data", amountData
+                )
+            )
         );
+        Receipt result = intent(new StubRpc(null, receipt, 0)).verify(hashCredential("0xpushedtx"), REQUEST);
+        assertThat(result.status()).isEqualTo("success");
+    }
+
+    @Test
+    void explicitMemoMustMatchExactly() {
+        String merchantMemo = "0x" + "ab".repeat(32);
+        Map<String, Object> request = new HashMap<>(REQUEST);
+        request.put("memo", merchantMemo);
+
+        Receipt result = intent(new StubRpc(null,
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, merchantMemo), 0))
+            .verify(hashCredential("0xpushedtx"), request);
+        assertThat(result.status()).isEqualTo("success");
+    }
+
+    @Test
+    void explicitMemoMismatchIsRejected() {
+        String merchantMemo = "0x" + "ab".repeat(32);
+        String otherMemo = "0x" + "cd".repeat(32);
+        Map<String, Object> request = new HashMap<>(REQUEST);
+        request.put("memo", merchantMemo);
+
+        assertThatThrownBy(() -> intent(new StubRpc(null,
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, otherMemo), 0))
+            .verify(hashCredential("0xpushedtx"), request))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("Transfer");
+    }
+
+    @Test
+    void explicitMemoDoesNotRequireChallengeBinding() {
+        String merchantMemo = "0x" + "ab".repeat(32);
+        Map<String, Object> request = new HashMap<>(REQUEST);
+        request.put("memo", merchantMemo);
+
+        Receipt result = intent(new StubRpc(null,
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, merchantMemo), 0))
+            .verify(hashCredential("0xpushedtx"), request);
+        assertThat(result.status()).isEqualTo("success");
+    }
+
+    @Test
+    void explicitMemoInMethodDetailsIsHonored() {
+        String merchantMemo = "0x" + "ab".repeat(32);
+        Map<String, Object> request = Map.of(
+            "amount", String.valueOf(AMOUNT_ATOMIC),
+            "currency", TOKEN_CONTRACT,
+            "recipient", RECIPIENT,
+            "methodDetails", Map.of("chainId", CHAIN_ID, "memo", merchantMemo)
+        );
+
+        Receipt result = intent(new StubRpc(null,
+            receiptWithMemoLog(TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, merchantMemo), 0))
+            .verify(hashCredential("0xpushedtx"), request);
+        assertThat(result.status()).isEqualTo("success");
+    }
+
+    @Test
+    void contractAddressMatchIsCaseInsensitive() {
+        Map<String, Object> receipt = receiptWithMemoLog(
+            TOKEN_CONTRACT.toUpperCase(), SENDER, RECIPIENT, AMOUNT_ATOMIC, BOUND_MEMO);
         StubRpc rpc = new StubRpc("0xtx", receipt, 0);
 
         Receipt result = intent(rpc).verify(txCredential("0xsignedtx"), REQUEST);
@@ -283,12 +433,113 @@ class TempoChargeIntentTest {
     }
 
     @Test
-    void contractAddressMatchIsCaseInsensitive() {
-        // Vary the casing of the contract address in the log
-        Map<String, Object> receipt = receiptWithLog(TOKEN_CONTRACT.toUpperCase(), SENDER, RECIPIENT, AMOUNT_ATOMIC);
-        StubRpc rpc = new StubRpc("0xtx", receipt, 0);
+    void parseHashCredentialSourceAbsentIsNull() {
+        assertThat(TempoChargeIntent.parseHashCredentialSource(null, CHAIN_ID)).isNull();
+        assertThat(TempoChargeIntent.parseHashCredentialSource("", CHAIN_ID)).isNull();
+    }
 
-        Receipt result = intent(rpc).verify(txCredential("0xsignedtx"), REQUEST);
-        assertThat(result.status()).isEqualTo("success");
+    @Test
+    void parseHashCredentialSourceValidReturnsAddress() {
+        assertThat(TempoChargeIntent.parseHashCredentialSource(didPkh(CHAIN_ID, SENDER), CHAIN_ID))
+            .isEqualTo(SENDER);
+    }
+
+    @Test
+    void parseHashCredentialSourceChainMismatchRejected() {
+        assertThatThrownBy(() ->
+            TempoChargeIntent.parseHashCredentialSource(didPkh(1, SENDER), CHAIN_ID))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("Hash credential source is invalid");
+    }
+
+    @Test
+    void parseHashCredentialSourceAcceptsStringChainId() {
+        assertThat(TempoChargeIntent.parseHashCredentialSource(didPkh(CHAIN_ID, SENDER), String.valueOf(CHAIN_ID)))
+            .isEqualTo(SENDER);
+    }
+
+    @Test
+    void parseHashCredentialSourceRejectsNonNumericChainId() {
+        assertThatThrownBy(() ->
+            TempoChargeIntent.parseHashCredentialSource(didPkh(CHAIN_ID, SENDER), "not-a-number"))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("Hash credential source is invalid");
+    }
+
+    @Test
+    void parseHashCredentialSourceRejectsMalformedVariants() {
+        List<String> malformed = List.of(
+            "not-a-valid-did",
+            "did:pkh:solana:" + CHAIN_ID + ":" + SENDER,
+            "did:pkh:eip155:04217:" + SENDER,
+            "did:pkh:eip155:not-a-number:" + SENDER,
+            "did:pkh:eip155:" + CHAIN_ID + ":extra:" + SENDER,
+            "did:pkh:eip155:" + CHAIN_ID + ":not-an-address"
+        );
+        for (String source : malformed) {
+            assertThatThrownBy(() -> TempoChargeIntent.parseHashCredentialSource(source, CHAIN_ID))
+                .as("case: %s", source)
+                .isInstanceOf(VerificationFailedException.class)
+                .hasMessageContaining("Hash credential source is invalid");
+        }
+    }
+
+    @Test
+    void hashAcceptsSourceMatchingTransferSender() {
+        Map<String, Object> receipt = receiptWithMemoLog(
+            TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, BOUND_MEMO);
+        Receipt result = intent(new StubRpc(null, receipt, 0))
+            .verify(hashCredential("0xpushedtx", didPkh(CHAIN_ID, SENDER)), REQUEST_WITH_CHAIN);
+        assertThat(result.reference()).isEqualTo("0xpushedtx");
+    }
+
+    @Test
+    void hashAcceptsSourceWhenReceiptSenderDiffers() {
+        Map<String, Object> receipt = new HashMap<>(receiptWithMemoLog(
+            TOKEN_CONTRACT, SENDER, RECIPIENT, AMOUNT_ATOMIC, BOUND_MEMO));
+        receipt.put("from", RECIPIENT);
+
+        Receipt result = intent(new StubRpc(null, receipt, 0))
+            .verify(hashCredential("0xpushedtx", didPkh(CHAIN_ID, SENDER)), REQUEST_WITH_CHAIN);
+        assertThat(result.reference()).isEqualTo("0xpushedtx");
+    }
+
+    @Test
+    void hashRejectsSourceDifferingFromTransferSender() {
+        Map<String, Object> receipt = receiptWithMemoLog(
+            TOKEN_CONTRACT, RECIPIENT, RECIPIENT, AMOUNT_ATOMIC, BOUND_MEMO);
+
+        assertThatThrownBy(() -> intent(new StubRpc(null, receipt, 0))
+            .verify(hashCredential("0xpushedtx", didPkh(CHAIN_ID, SENDER)), REQUEST_WITH_CHAIN))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("Transfer");
+    }
+
+    @Test
+    void malformedSourceDoesNotConsumeReplayClaim() {
+        Store store = new MemoryStore();
+
+        assertThatThrownBy(() -> intent(new StubRpc(null, successReceipt(), 0), store)
+            .verify(hashCredential("0xpushedtx", "not-a-did"), REQUEST_WITH_CHAIN))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("Hash credential source is invalid");
+
+        Receipt receipt = intent(new StubRpc(null, successReceipt(), 0), store)
+            .verify(hashCredential("0xpushedtx"), REQUEST);
+        assertThat(receipt.reference()).isEqualTo("0xpushedtx");
+    }
+
+    @Test
+    void wrongChainSourceDoesNotConsumeReplayClaim() {
+        Store store = new MemoryStore();
+
+        assertThatThrownBy(() -> intent(new StubRpc(null, successReceipt(), 0), store)
+            .verify(hashCredential("0xpushedtx", didPkh(1, SENDER)), REQUEST_WITH_CHAIN))
+            .isInstanceOf(VerificationFailedException.class)
+            .hasMessageContaining("Hash credential source is invalid");
+
+        Receipt receipt = intent(new StubRpc(null, successReceipt(), 0), store)
+            .verify(hashCredential("0xpushedtx"), REQUEST);
+        assertThat(receipt.reference()).isEqualTo("0xpushedtx");
     }
 }

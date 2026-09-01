@@ -9,10 +9,13 @@ import com.stripe.mpp.store.MemoryStore;
 import com.stripe.mpp.store.Store;
 
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Server-side intent that verifies Tempo payments.
@@ -24,6 +27,13 @@ import java.util.Objects;
  *   <li>{@code "hash"} — a transaction hash already broadcast by the client (push flow);
  *       the server polls for the receipt directly.</li>
  * </ul>
+ *
+ * <p>A qualifying Transfer of the requested token, recipient and amount is not
+ * enough. Unless the merchant set an explicit memo, the matched logs must include
+ * a {@code TransferWithMemo} whose memo is bound to this challenge (MPP attribution
+ * tag, server fingerprint of the challenge realm, and nonce
+ * {@code keccak256(challengeId)[0..6]}). That is what stops a third party from
+ * presenting someone else's settled transaction as their own payment.
  *
  * <p>Create the intent once and reuse it so its replay store is shared across requests:
  *
@@ -46,6 +56,10 @@ public class TempoChargeIntent implements Intent {
     static final String TRANSFER_WITH_MEMO_TOPIC =
         "0x57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0";
     private static final String REPLAY_KEY_PREFIX = "tempo:hash:";
+    private static final Pattern PKH_SOURCE =
+        Pattern.compile("^did:pkh:eip155:(0|[1-9]\\d*):([^:]+)$");
+    private static final Pattern ADDRESS =
+        Pattern.compile("^0x[a-fA-F0-9]{40}$");
 
     private final String rpcUrl;
     private final int maxRetries;
@@ -96,22 +110,25 @@ public class TempoChargeIntent implements Intent {
         String type = (String) payload.get("type");
         if ("transaction".equals(type)) {
             // Pull: client signed the tx, server broadcasts it.
-            return verifyTransaction((String) payload.get("signature"), request);
+            return verifyTransaction((String) payload.get("signature"), request, credential);
         }
         if ("hash".equals(type)) {
             // Push: client already broadcast, server just verifies the receipt.
-            return verifyHash((String) payload.get("hash"), request);
+            return verifyHash((String) payload.get("hash"), request, credential);
         }
         throw new VerificationFailedException("unrecognized payload type: " + type);
     }
 
-    private Receipt verifyTransaction(String rawTx, Map<String, Object> request) {
+    private Receipt verifyTransaction(String rawTx, Map<String, Object> request, Credential credential) {
         String txHash = rpc.sendRawTransaction(rpcUrl, rawTx);
-        return claimOnce(awaitReceipt(txHash, request));
+        return claimOnce(awaitReceipt(txHash, request, credential, null));
     }
 
-    private Receipt verifyHash(String txHash, Map<String, Object> request) {
-        return claimOnce(awaitReceipt(txHash, request));
+    private Receipt verifyHash(String txHash, Map<String, Object> request, Credential credential) {
+        // Validate the declared payer before reserving the hash so a malformed
+        // source cannot burn an otherwise valid payment.
+        String sourceAddress = parseHashCredentialSource(credential.source(), chainIdFrom(request));
+        return claimOnce(awaitReceipt(txHash, request, credential, sourceAddress));
     }
 
     /** Records first use of the settled transaction, rejecting a hash that was already claimed. */
@@ -123,17 +140,27 @@ public class TempoChargeIntent implements Intent {
         return receipt;
     }
 
-    private Receipt awaitReceipt(String txHash, Map<String, Object> request) {
+    private Receipt awaitReceipt(
+        String txHash,
+        Map<String, Object> request,
+        Credential credential,
+        String sourceAddress
+    ) {
         for (int i = 0; i < maxRetries; i++) {
             Map<String, Object> receipt = rpc.getTransactionReceipt(rpcUrl, txHash);
             if (receipt != null) {
                 if (!"0x1".equals(receipt.get("status"))) {
                     throw new VerificationFailedException("transaction reverted");
                 }
-                if (!matchTransferLogs(receipt, request)) {
+                String expectedSender = sourceAddress != null ? sourceAddress : (String) receipt.get("from");
+                List<MatchedLog> matched = matchTransferLogs(receipt, request, expectedSender);
+                if (matched.isEmpty()) {
                     throw new VerificationFailedException(
                         "transaction logs contain no Transfer matching the request currency, recipient, and amount"
                     );
+                }
+                if (memoFrom(request) == null) {
+                    assertChallengeBoundMemo(matched, credential);
                 }
                 return Receipt.success(txHash, "tempo");
             }
@@ -150,30 +177,36 @@ public class TempoChargeIntent implements Intent {
     }
 
     /**
-     * Returns true if the receipt contains at least one ERC-20 Transfer (or TransferWithMemo)
-     * log that matches the request's currency (token contract), recipient, sender, and amount.
+     * Collects ERC-20 Transfer / TransferWithMemo logs that match the request's
+     * currency, recipient, amount, expected sender, and (when set) merchant memo.
      *
-     * The request amount must already be in atomic units (i.e. after transformRequest has run).
+     * <p>The request amount must already be in atomic units (i.e. after
+     * transformRequest has run).
      */
     @SuppressWarnings("unchecked")
-    private boolean matchTransferLogs(Map<String, Object> receipt, Map<String, Object> request) {
+    private List<MatchedLog> matchTransferLogs(
+        Map<String, Object> receipt,
+        Map<String, Object> request,
+        String expectedSender
+    ) {
         String currency  = (String) request.get("currency");
         String recipient = (String) request.get("recipient");
         String amountStr = (String) request.get("amount");
-        String sender    = (String) receipt.get("from");
+        String expectedMemo = normalizeMemo(memoFrom(request));
 
-        if (currency == null || recipient == null || amountStr == null) return false;
+        if (currency == null || recipient == null || amountStr == null) return List.of();
 
         BigInteger expectedAmount;
         try {
             expectedAmount = new BigInteger(amountStr);
         } catch (NumberFormatException e) {
-            return false;
+            return List.of();
         }
 
         List<Object> logs = (List<Object>) receipt.get("logs");
-        if (logs == null) return false;
+        if (logs == null) return List.of();
 
+        List<MatchedLog> matched = new ArrayList<>();
         for (Object logObj : logs) {
             Map<String, Object> log = (Map<String, Object>) logObj;
 
@@ -188,12 +221,18 @@ public class TempoChargeIntent implements Intent {
             boolean isTransferWithMemo = TRANSFER_WITH_MEMO_TOPIC.equalsIgnoreCase(topic0);
             if (!isTransfer && !isTransferWithMemo) continue;
             if (isTransferWithMemo && topics.size() < 4) continue;
+            if (expectedMemo != null && !isTransferWithMemo) continue;
 
             String fromAddress = "0x" + topics.get(1).substring(topics.get(1).length() - 40);
             String toAddress   = "0x" + topics.get(2).substring(topics.get(2).length() - 40);
 
             if (!toAddress.equalsIgnoreCase(recipient)) continue;
-            if (sender != null && !fromAddress.equalsIgnoreCase(sender)) continue;
+            if (expectedSender != null && !fromAddress.equalsIgnoreCase(expectedSender)) continue;
+
+            if (expectedMemo != null) {
+                String logMemo = normalizeMemo(topics.get(3));
+                if (logMemo == null || !logMemo.equals(expectedMemo)) continue;
+            }
 
             String data = (String) log.get("data");
             if (data == null || data.length() < 66) continue;
@@ -202,13 +241,107 @@ public class TempoChargeIntent implements Intent {
                 String dataHex = data.startsWith("0x") || data.startsWith("0X")
                     ? data.substring(2) : data;
                 BigInteger logAmount = new BigInteger(dataHex, 16);
-                if (logAmount.equals(expectedAmount)) return true;
+                if (!logAmount.equals(expectedAmount)) continue;
+                matched.add(new MatchedLog(isTransferWithMemo, isTransferWithMemo ? topics.get(3) : null));
             } catch (NumberFormatException e) {
                 // malformed data field, skip this log
             }
         }
 
-        return false;
+        return matched;
+    }
+
+    private static void assertChallengeBoundMemo(List<MatchedLog> matched, Credential credential) {
+        String realm = credential.challenge().realm();
+        String challengeId = credential.challenge().id();
+        for (MatchedLog log : matched) {
+            if (!log.memo) continue;
+            if (Attribution.verifyServer(log.memoValue, realm)
+                && Attribution.verifyChallengeBinding(log.memoValue, challengeId)) {
+                return;
+            }
+        }
+        throw new VerificationFailedException("memo is not bound to this challenge");
+    }
+
+    /**
+     * Parses a hash-credential source. {@code null} or empty if absent; the
+     * address for a {@code did:pkh:eip155} DID matching {@code expectedChainId};
+     * otherwise raises.
+     */
+    static String parseHashCredentialSource(String source, Object expectedChainId) {
+        if (source == null || source.isEmpty()) return null;
+        ParsedPkh parsed = parsePkhSource(source);
+        Integer expected = parseChainIdValue(expectedChainId);
+        if (parsed == null || (expected != null && parsed.chainId != expected)) {
+            throw new VerificationFailedException("Hash credential source is invalid");
+        }
+        return parsed.address;
+    }
+
+    static Object chainIdFrom(Map<String, Object> request) {
+        Object details = request.get("methodDetails");
+        if (!(details instanceof Map<?, ?>)) return null;
+        return ((Map<?, ?>) details).get("chainId");
+    }
+
+    static Integer parseChainIdValue(Object raw) {
+        if (raw == null) return null;
+        if (raw instanceof Number) return ((Number) raw).intValue();
+        if (raw instanceof String) {
+            try {
+                return Integer.valueOf((String) raw);
+            } catch (NumberFormatException e) {
+                throw new VerificationFailedException("Hash credential source is invalid");
+            }
+        }
+        throw new VerificationFailedException("Hash credential source is invalid");
+    }
+
+    static ParsedPkh parsePkhSource(String source) {
+        Matcher match = PKH_SOURCE.matcher(source);
+        if (!match.matches()) return null;
+        if (!ADDRESS.matcher(match.group(2)).matches()) return null;
+        return new ParsedPkh(match.group(2), Integer.parseInt(match.group(1)));
+    }
+
+    static String memoFrom(Map<String, Object> request) {
+        Object top = request.get("memo");
+        if (top instanceof String && !((String) top).isEmpty()) return (String) top;
+        Object details = request.get("methodDetails");
+        if (details instanceof Map<?, ?>) {
+            Object nested = ((Map<?, ?>) details).get("memo");
+            if (nested instanceof String && !((String) nested).isEmpty()) return (String) nested;
+        }
+        return null;
+    }
+
+    static String normalizeMemo(String memo) {
+        if (memo == null) return null;
+        String value = memo.trim();
+        if (value.isEmpty()) return null;
+        if (!value.startsWith("0x") && !value.startsWith("0X")) value = "0x" + value;
+        return value.toLowerCase(Locale.ROOT);
+    }
+
+    static final class ParsedPkh {
+        final String address;
+        final int chainId;
+
+        ParsedPkh(String address, int chainId) {
+            this.address = address;
+            this.chainId = chainId;
+        }
+    }
+
+    private static final class MatchedLog {
+        final boolean memo;
+        final String memoValue;
+
+        MatchedLog(boolean memo, String memoValue) {
+            this.memo = memo;
+            this.memoValue = memoValue;
+        }
     }
 }
 
