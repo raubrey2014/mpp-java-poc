@@ -11,7 +11,7 @@ Java SDK for the [**Machine Payments Protocol**](https://mpp.dev)
 ### Gradle
 
 ```groovy
-implementation 'com.stripe:mpp-java:0.1.3'
+implementation 'com.stripe:mpp-java:0.1.4'
 ```
 
 ### Maven
@@ -20,7 +20,7 @@ implementation 'com.stripe:mpp-java:0.1.3'
 <dependency>
     <groupId>com.stripe</groupId>
     <artifactId>mpp-java</artifactId>
-    <version>0.1.3</version>
+    <version>0.1.4</version>
 </dependency>
 ```
 
